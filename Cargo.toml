@@ -10,3 +10,7 @@ anyhow = "1.0"
 itertools =  "0.12"
 tch = "0.16"
 torch-sys = { version = "0.16", features = ["download-libtorch"] }
+
+[[bin]]
+name = "mlp"
+path = "src/mlp.rs"
