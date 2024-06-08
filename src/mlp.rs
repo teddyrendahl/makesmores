@@ -2,43 +2,62 @@ use std::collections::{BTreeMap, HashMap};
 
 use anyhow::Result;
 use itertools::Itertools;
+use rand::seq::SliceRandom;
+use rand::SeedableRng;
+use rand_chacha::ChaCha12Rng;
 use tch::{IndexOp, Kind};
 
 const EDGE_TOKEN: char = '.';
 const SEED: i64 = 2147483647;
+const EMBEDDING_SIZE: i64 = 5;
+const CHUNK_SIZE: i64 = 3;
+const HIDDEN_LAYER_SIZE: i64 = 100;
 
 fn main() -> Result<()> {
     tch::manual_seed(SEED);
     let device = tch::Device::cuda_if_available();
-    let names = get_names()?;
-
+    let mut names = get_names()?;
     // Generate a mapping of token to integer (and the reverse)
-    let (c_to_i, _i_to_c) = create_char_maps(&names);
+    let (c_to_i, i_to_c) = create_char_maps(&names);
 
-    let (xs, ys) = load_data(&names, &c_to_i, 3);
+    // Split dataset into train, dev, test
+    let mut rng = ChaCha12Rng::seed_from_u64(42);
+    names.shuffle(&mut rng);
+    let n1 = (names.len() as f32 * 0.8) as usize;
+    let n2 = (names.len() as f32 * 0.9) as usize;
 
-    let mut c = tch::Tensor::randn([27, 2], (Kind::Float, device)).requires_grad_(true);
-    let mut w1 = tch::Tensor::randn([6, 100], (Kind::Float, device)).requires_grad_(true);
-    let mut b1 = tch::Tensor::randn([100], (Kind::Float, device)).requires_grad_(true);
-    let mut w2 = tch::Tensor::randn([100, 27], (Kind::Float, device)).requires_grad_(true);
+    let (xtr, ytr) = load_data(&names[0..n1], &c_to_i, CHUNK_SIZE as usize);
+    let (xdev, ydev) = load_data(&names[n1..n2], &c_to_i, CHUNK_SIZE as usize);
+    let (xte, yte) = load_data(&names[n2..], &c_to_i, CHUNK_SIZE as usize);
+
+    let mut c =
+        tch::Tensor::randn([27, EMBEDDING_SIZE], (Kind::Float, device)).requires_grad_(true);
+    let mut w1 = tch::Tensor::randn(
+        [CHUNK_SIZE * EMBEDDING_SIZE, HIDDEN_LAYER_SIZE],
+        (Kind::Float, device),
+    )
+    .requires_grad_(true);
+    let mut b1 =
+        tch::Tensor::randn([HIDDEN_LAYER_SIZE], (Kind::Float, device)).requires_grad_(true);
+    let mut w2 =
+        tch::Tensor::randn([HIDDEN_LAYER_SIZE, 27], (Kind::Float, device)).requires_grad_(true);
     let mut b2 = tch::Tensor::randn([27], (Kind::Float, device)).requires_grad_(true);
 
-    for _ in 0..100000 {
-        let ix = tch::Tensor::randint(xs.size()[0], [32], (Kind::Int, device));
-        let samples = xs.i(&ix);
-        let labels = ys.i(&ix);
+    for i in 0..200000 {
+        let ix = tch::Tensor::randint(xtr.size()[0], [32], (Kind::Int, device));
+        let samples = xtr.i(&ix);
+        let labels = ytr.i(&ix);
         let emb = c.index(&[Some(samples)]);
-        let h = (emb.view_([-1, 6]).matmul(&w1) + &b1).tanh();
+        let h = (emb.view_([-1, CHUNK_SIZE * EMBEDDING_SIZE]).matmul(&w1) + &b1).tanh();
         let logits = h.matmul(&w2) + &b2;
         let loss = logits.cross_entropy_for_logits(&labels);
-        // loss.print();
 
         for p in [&mut w1, &mut b1, &mut c, &mut w2, &mut b2] {
             p.zero_grad();
         }
         loss.backward();
 
-        let lr = -0.1;
+        let lr = if i < 100000 { -0.1 } else { -0.01 };
         tch::no_grad(|| {
             c += c.grad() * lr;
             w1 += w1.grad() * lr;
@@ -47,11 +66,44 @@ fn main() -> Result<()> {
             b2 += b2.grad() * lr;
         });
     }
-    let emb = c.index(&[Some(xs)]);
-    let h = (emb.view_([-1, 6]).matmul(&w1) + &b1).tanh();
+    // Final test loss
+    println!("Training loss");
+    let emb = c.index(&[Some(xtr)]);
+    let h = (emb.view_([-1, CHUNK_SIZE * EMBEDDING_SIZE]).matmul(&w1) + &b1).tanh();
     let logits = h.matmul(&w2) + &b2;
-    let loss = logits.cross_entropy_for_logits(&ys);
-    loss.print();
+    logits.cross_entropy_for_logits(&ytr).print();
+
+    println!("Dev loss");
+    let emb = c.index(&[Some(xdev)]);
+    let h = (emb.view_([-1, CHUNK_SIZE * EMBEDDING_SIZE]).matmul(&w1) + &b1).tanh();
+    let logits = h.matmul(&w2) + &b2;
+    logits.cross_entropy_for_logits(&ydev).print();
+
+    println!("Test loss");
+    let emb = c.index(&[Some(xte)]);
+    let h = (emb.view_([-1, CHUNK_SIZE * EMBEDDING_SIZE]).matmul(&w1) + &b1).tanh();
+    let logits = h.matmul(&w2) + &b2;
+    logits.cross_entropy_for_logits(&yte).print();
+
+    for _ in 0..20 {
+        let mut out = Vec::new();
+        let mut ctx = tch::Tensor::zeros([CHUNK_SIZE], (Kind::Int, device));
+        loop {
+            let emb = c.index(&[Some(&ctx)]);
+            let h = (emb.view_([1, -1]).matmul(&w1) + &b1).tanh();
+            let logits = h.matmul(&w2) + &b2;
+            let prob = logits.softmax(1, Kind::Float);
+            let idx = prob.multinomial(1, true).get(0).int64_value(&[0]);
+            out.push(i_to_c[&(idx as usize)]);
+            if idx == 0 {
+                break;
+            }
+            ctx = tch::Tensor::cat(&[ctx.i(1..), tch::Tensor::from_slice(&[idx])], 0);
+        }
+        println!("{}", out.into_iter().join(""));
+    }
+    // Generate a name by repeatedly sampling from the probability distribution of bigrams
+    // until an end token is found.
     Ok(())
 }
 
@@ -96,10 +148,6 @@ fn load_data(
             ctx.rotate_left(1);
             ctx[block_size - 1] = ci;
         }
-        // for (c1, c2) in edged_name.chars().zip(edged_name.chars().skip(1)) {
-        //     xs.push(char_map[&c1] as i8);
-        //     ys.push(char_map[&c2] as i8);
-        // }
     }
     (
         tch::Tensor::from_slice2(&xs).to_kind(Kind::Int),
