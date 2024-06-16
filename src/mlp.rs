@@ -12,6 +12,136 @@ const SEED: i64 = 2147483647;
 const EMBEDDING_SIZE: i64 = 5;
 const CHUNK_SIZE: i64 = 3;
 const HIDDEN_LAYER_SIZE: i64 = 100;
+const BATCH_SIZE: i64 = 32;
+
+trait Layer {
+    fn forward(&mut self, x: tch::Tensor) -> tch::Tensor;
+    fn zero_grad(&mut self);
+    fn backward(&mut self, learning_rate: f64);
+}
+
+struct Linear {
+    weight: tch::Tensor,
+    bias: Option<tch::Tensor>,
+}
+
+impl Linear {
+    pub fn new(fan_in: i64, fan_out: i64, bias: bool, device: tch::Device) -> Self {
+        let weight =
+            tch::Tensor::randn([fan_in, fan_out], (Kind::Float, device)).set_requires_grad(true);
+        let bias_layer = if bias {
+            let b = tch::Tensor::randn([fan_out], (Kind::Float, device)).set_requires_grad(true);
+            Some(b)
+        } else {
+            None
+        };
+        Linear {
+            weight,
+            bias: bias_layer,
+        }
+    }
+}
+
+impl Layer for Linear {
+    fn forward(&mut self, x: tch::Tensor) -> tch::Tensor {
+        let mut out = x.matmul(&self.weight);
+        if let Some(b) = &self.bias {
+            out += b;
+        }
+        out
+    }
+
+    fn zero_grad(&mut self) {
+        self.weight.zero_grad();
+        if let Some(b) = self.bias.as_mut() {
+            b.zero_grad()
+        }
+    }
+
+    fn backward(&mut self, learning_rate: f64) {
+        self.weight += self.weight.grad() * (-learning_rate);
+        let bias = self.bias.take();
+        if let Some(mut b) = bias {
+            b += b.grad() * (-learning_rate);
+            self.bias = Some(b);
+        }
+    }
+}
+
+struct BatchNorm1D {
+    eps: f64,
+    momentum: f32,
+    gamma: tch::Tensor,
+    beta: tch::Tensor,
+    running_mean: tch::Tensor,
+    running_var: tch::Tensor,
+    training: bool,
+}
+
+impl BatchNorm1D {
+    pub fn new(dim: i64, eps: f64, momentum: f32, device: tch::Device) -> Self {
+        Self {
+            eps,
+            momentum,
+            gamma: tch::Tensor::ones([dim], (Kind::Float, device)).requires_grad_(true),
+            beta: tch::Tensor::zeros([dim], (Kind::Float, device)).requires_grad_(true),
+            running_mean: tch::Tensor::zeros([dim], (Kind::Float, device)),
+            running_var: tch::Tensor::ones([dim], (Kind::Float, device)),
+            training: true,
+        }
+    }
+}
+
+impl Layer for BatchNorm1D {
+    fn forward(&mut self, x: tch::Tensor) -> tch::Tensor {
+        let (xmean, xvar) = if self.training {
+            let xmean = x.mean(Some(Kind::Float));
+            let xvar = x.var(true);
+            (xmean, xvar)
+        } else {
+            (
+                self.running_mean.shallow_clone(),
+                self.running_var.shallow_clone(),
+            )
+        };
+        let xhat = (x - xmean.shallow_clone()) / (&xvar + self.eps).sqrt();
+        if self.training {
+            let _g = tch::no_grad_guard();
+            self.running_mean =
+                (1.0 - self.momentum) * self.running_mean.shallow_clone() + self.momentum * xmean;
+            self.running_var =
+                (1.0 - self.momentum) * self.running_var.shallow_clone() + self.momentum * xvar;
+        }
+        (&self.gamma * xhat) + &self.beta
+    }
+
+    fn zero_grad(&mut self) {
+        self.gamma.zero_grad();
+        self.beta.zero_grad();
+    }
+
+    fn backward(&mut self, learning_rate: f64) {
+        self.gamma += self.gamma.grad() * (-learning_rate);
+        self.beta += self.beta.grad() * (-learning_rate);
+    }
+}
+
+struct Tanh {}
+
+impl Tanh {
+    pub fn new() -> Self {
+        Tanh {}
+    }
+}
+
+impl Layer for Tanh {
+    fn forward(&mut self, x: tch::Tensor) -> tch::Tensor {
+        x.tanh()
+    }
+
+    fn zero_grad(&mut self) {}
+    fn backward(&mut self, _learning_rate: f64) {}
+}
 
 fn main() -> Result<()> {
     tch::manual_seed(SEED);
@@ -27,72 +157,82 @@ fn main() -> Result<()> {
     let n2 = (names.len() as f32 * 0.9) as usize;
 
     let (xtr, ytr) = load_data(&names[0..n1], &c_to_i, CHUNK_SIZE as usize);
-    let (xdev, ydev) = load_data(&names[n1..n2], &c_to_i, CHUNK_SIZE as usize);
-    let (xte, yte) = load_data(&names[n2..], &c_to_i, CHUNK_SIZE as usize);
+    let (_xdev, _ydev) = load_data(&names[n1..n2], &c_to_i, CHUNK_SIZE as usize);
+    let (_xte, _yte) = load_data(&names[n2..], &c_to_i, CHUNK_SIZE as usize);
 
     let mut c =
         tch::Tensor::randn([27, EMBEDDING_SIZE], (Kind::Float, device)).requires_grad_(true);
-    let mut w1 = tch::Tensor::randn(
-        [CHUNK_SIZE * EMBEDDING_SIZE, HIDDEN_LAYER_SIZE],
-        (Kind::Float, device),
-    )
-    .requires_grad_(true);
-    let mut b1 =
-        tch::Tensor::randn([HIDDEN_LAYER_SIZE], (Kind::Float, device)).requires_grad_(true);
-    let mut w2 =
-        tch::Tensor::randn([HIDDEN_LAYER_SIZE, 27], (Kind::Float, device)).requires_grad_(true);
-    let mut b2 = tch::Tensor::randn([27], (Kind::Float, device)).requires_grad_(true);
 
-    for i in 0..200000 {
-        let ix = tch::Tensor::randint(xtr.size()[0], [32], (Kind::Int, device));
+    let mut layers: Vec<Box<dyn Layer>> = [
+        (EMBEDDING_SIZE * CHUNK_SIZE, HIDDEN_LAYER_SIZE),
+        (HIDDEN_LAYER_SIZE, HIDDEN_LAYER_SIZE),
+        (HIDDEN_LAYER_SIZE, HIDDEN_LAYER_SIZE),
+        (HIDDEN_LAYER_SIZE, HIDDEN_LAYER_SIZE),
+        (HIDDEN_LAYER_SIZE, HIDDEN_LAYER_SIZE),
+    ]
+    .into_iter()
+    .flat_map(|(f_in, f_out)| {
+        let mut linear = Linear::new(f_in, f_out, true, device);
+        let _g = tch::no_grad_guard();
+        linear.weight *= (5.0 / 3.0) / (EMBEDDING_SIZE as f32 * CHUNK_SIZE as f32).sqrt();
+        [
+            Box::new(linear) as Box<dyn Layer>,
+            Box::new(BatchNorm1D::new(HIDDEN_LAYER_SIZE, 1e-5, 0.1, device)),
+            Box::new(Tanh::new()) as _,
+        ]
+    })
+    .collect();
+
+    let mut last_linear = Linear::new(HIDDEN_LAYER_SIZE, 27, true, device);
+    {
+        let _g = tch::no_grad_guard();
+        last_linear.weight *= 0.1;
+    }
+    layers.push(Box::new(last_linear));
+    for i in 0..200_000 {
+        let ix = tch::Tensor::randint(xtr.size()[0], [BATCH_SIZE], (Kind::Int, device));
         let samples = xtr.i(&ix);
         let labels = ytr.i(&ix);
         let emb = c.index(&[Some(samples)]);
-        let h = (emb.view_([-1, CHUNK_SIZE * EMBEDDING_SIZE]).matmul(&w1) + &b1).tanh();
-        let logits = h.matmul(&w2) + &b2;
-        let loss = logits.cross_entropy_for_logits(&labels);
+        let mut x = emb.view_([-1, CHUNK_SIZE * EMBEDDING_SIZE]);
 
-        for p in [&mut w1, &mut b1, &mut c, &mut w2, &mut b2] {
-            p.zero_grad();
+        for layer in &mut layers {
+            x = layer.forward(x);
+        }
+        let loss = x.cross_entropy_for_logits(&labels);
+        c.zero_grad();
+        for l in &mut layers {
+            l.zero_grad()
         }
         loss.backward();
+        let lr = if i < 100_000 { 0.1 } else { 0.01 };
 
-        let lr = if i < 100000 { -0.1 } else { -0.01 };
         tch::no_grad(|| {
-            c += c.grad() * lr;
-            w1 += w1.grad() * lr;
-            b1 += b1.grad() * lr;
-            w2 += w2.grad() * lr;
-            b2 += b2.grad() * lr;
+            c += c.grad() * (-lr);
+            for l in &mut layers {
+                l.backward(lr)
+            }
         });
+
+        if i % 10_000 == 0 {
+            loss.print()
+        }
     }
-    // Final test loss
-    println!("Training loss");
-    let emb = c.index(&[Some(xtr)]);
-    let h = (emb.view_([-1, CHUNK_SIZE * EMBEDDING_SIZE]).matmul(&w1) + &b1).tanh();
-    let logits = h.matmul(&w2) + &b2;
-    logits.cross_entropy_for_logits(&ytr).print();
 
-    println!("Dev loss");
-    let emb = c.index(&[Some(xdev)]);
-    let h = (emb.view_([-1, CHUNK_SIZE * EMBEDDING_SIZE]).matmul(&w1) + &b1).tanh();
-    let logits = h.matmul(&w2) + &b2;
-    logits.cross_entropy_for_logits(&ydev).print();
+    tch::manual_seed(SEED + 10);
 
-    println!("Test loss");
-    let emb = c.index(&[Some(xte)]);
-    let h = (emb.view_([-1, CHUNK_SIZE * EMBEDDING_SIZE]).matmul(&w1) + &b1).tanh();
-    let logits = h.matmul(&w2) + &b2;
-    logits.cross_entropy_for_logits(&yte).print();
-
+    // Generate a name by repeatedly sampling from the probability distribution of bigrams
+    // until an end token is found.
     for _ in 0..20 {
         let mut out = Vec::new();
         let mut ctx = tch::Tensor::zeros([CHUNK_SIZE], (Kind::Int, device));
         loop {
             let emb = c.index(&[Some(&ctx)]);
-            let h = (emb.view_([1, -1]).matmul(&w1) + &b1).tanh();
-            let logits = h.matmul(&w2) + &b2;
-            let prob = logits.softmax(1, Kind::Float);
+            let mut x = emb.view_([1, -1]);
+            for l in &mut layers {
+                x = l.forward(x);
+            }
+            let prob = x.softmax(1, Kind::Float);
             let idx = prob.multinomial(1, true).get(0).int64_value(&[0]);
             out.push(i_to_c[&(idx as usize)]);
             if idx == 0 {
@@ -102,8 +242,6 @@ fn main() -> Result<()> {
         }
         println!("{}", out.into_iter().join(""));
     }
-    // Generate a name by repeatedly sampling from the probability distribution of bigrams
-    // until an end token is found.
     Ok(())
 }
 
