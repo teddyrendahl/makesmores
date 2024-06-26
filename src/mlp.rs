@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::{collections::{BTreeMap, HashMap}, vec};
 
 use anyhow::Result;
 use itertools::Itertools;
@@ -9,9 +9,9 @@ use tch::{IndexOp, Kind};
 
 const EDGE_TOKEN: char = '.';
 const SEED: i64 = 2147483647;
-const EMBEDDING_SIZE: i64 = 10;
+const EMBEDDING_SIZE: i64 = 24;
 const CHUNK_SIZE: i64 = 8;
-const HIDDEN_LAYER_SIZE: i64 = 100;
+const HIDDEN_LAYER_SIZE: i64 = 128;
 const BATCH_SIZE: i64 = 32;
 const VOCAB_SIZE: i64 = 27;
 
@@ -98,8 +98,13 @@ impl BatchNorm1D {
 impl Layer for BatchNorm1D {
     fn forward(&mut self, x: tch::Tensor) -> tch::Tensor {
         let (xmean, xvar) = if self.training {
-            let xmean = x.mean(Some(Kind::Float));
-            let xvar = x.var(true);
+            let dim = match x.dim() {
+                2 => vec![0],
+                3 => vec![0, 1],
+                d => panic!("Unsupported vector size {}", d)
+            };
+            let xmean = x.mean_dim(&dim, true,Some(Kind::Float));
+            let xvar = x.var_dim(&dim, true, true);
             (xmean, xvar)
         } else {
             (
@@ -202,13 +207,20 @@ impl Layer for Embedding {
     }
 }
 
-struct Flatten {}
+struct FlattenConsecutive {
+    n: i64,
+}
 
-impl Layer for Flatten {
+impl Layer for FlattenConsecutive {
     fn forward(&mut self, x: tch::Tensor) -> tch::Tensor {
-        x.view([x.size()[0], -1])
+        let mut out = x.view([x.size()[0], x.size()[1] / self.n, x.size()[2] * self.n]);
+        if out.size()[1] == 1 {
+            out = out.squeeze_dim(1)
+        }
+        out
     }
 }
+
 fn main() -> Result<()> {
     tch::manual_seed(SEED);
     let device = tch::Device::cuda_if_available();
@@ -221,16 +233,34 @@ fn main() -> Result<()> {
     names.shuffle(&mut rng);
     let n1 = (names.len() as f32 * 0.8) as usize;
     let n2 = (names.len() as f32 * 0.9) as usize;
-
+    tch::nn::Linear
     let (xtr, ytr) = load_data(&names[0..n1], &c_to_i, CHUNK_SIZE as usize);
     let (xdev, ydev) = load_data(&names[n1..n2], &c_to_i, CHUNK_SIZE as usize);
     let (_xte, _yte) = load_data(&names[n2..], &c_to_i, CHUNK_SIZE as usize);
 
     let mut layers: Vec<Box<dyn Layer>> = vec![
         Box::new(Embedding::new(VOCAB_SIZE, EMBEDDING_SIZE, device)),
-        Box::new(Flatten {}),
+        Box::new(FlattenConsecutive { n: 2 }),
         Box::new(Linear::new(
-            EMBEDDING_SIZE * CHUNK_SIZE,
+            EMBEDDING_SIZE * 2,
+            HIDDEN_LAYER_SIZE,
+            false,
+            device,
+        )),
+        Box::new(BatchNorm1D::new(HIDDEN_LAYER_SIZE, 1e-5, 0.1, device)),
+        Box::new(Tanh::new()),
+        Box::new(FlattenConsecutive { n: 2 }),
+        Box::new(Linear::new(
+            HIDDEN_LAYER_SIZE * 2,
+            HIDDEN_LAYER_SIZE,
+            false,
+            device,
+        )),
+        Box::new(BatchNorm1D::new(HIDDEN_LAYER_SIZE, 1e-5, 0.1, device)),
+        Box::new(Tanh::new()),
+        Box::new(FlattenConsecutive { n: 2 }),
+        Box::new(Linear::new(
+            HIDDEN_LAYER_SIZE * 2,
             HIDDEN_LAYER_SIZE,
             false,
             device,
