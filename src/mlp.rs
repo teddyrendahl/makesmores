@@ -18,6 +18,7 @@ trait Layer {
     fn forward(&mut self, x: tch::Tensor) -> tch::Tensor;
     fn zero_grad(&mut self);
     fn backward(&mut self, learning_rate: f64);
+    fn set_training(&mut self, _training: bool) {}
 }
 
 struct Linear {
@@ -124,6 +125,10 @@ impl Layer for BatchNorm1D {
         self.gamma += self.gamma.grad() * (-learning_rate);
         self.beta += self.beta.grad() * (-learning_rate);
     }
+
+    fn set_training(&mut self, training: bool) {
+        self.training = training;
+    }
 }
 
 struct Tanh {}
@@ -172,7 +177,7 @@ fn main() -> Result<()> {
     ]
     .into_iter()
     .flat_map(|(f_in, f_out)| {
-        let mut linear = Linear::new(f_in, f_out, true, device);
+        let mut linear = Linear::new(f_in, f_out, false, device);
         let _g = tch::no_grad_guard();
         linear.weight *= (5.0 / 3.0) / (EMBEDDING_SIZE as f32 * CHUNK_SIZE as f32).sqrt();
         [
@@ -220,6 +225,10 @@ fn main() -> Result<()> {
     }
 
     tch::manual_seed(SEED + 10);
+
+    for layer in layers.iter_mut() {
+        layer.set_training(false);
+    }
 
     // Generate a name by repeatedly sampling from the probability distribution of bigrams
     // until an end token is found.
