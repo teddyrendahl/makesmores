@@ -9,8 +9,8 @@ use tch::{IndexOp, Kind};
 
 const EDGE_TOKEN: char = '.';
 const SEED: i64 = 2147483647;
-const EMBEDDING_SIZE: i64 = 5;
-const CHUNK_SIZE: i64 = 3;
+const EMBEDDING_SIZE: i64 = 10;
+const CHUNK_SIZE: i64 = 8;
 const HIDDEN_LAYER_SIZE: i64 = 100;
 const BATCH_SIZE: i64 = 32;
 const VOCAB_SIZE: i64 = 27;
@@ -273,7 +273,7 @@ fn main() -> Result<()> {
         let mut out = Vec::new();
         let mut ctx = tch::Tensor::zeros(CHUNK_SIZE, (Kind::Int, device));
         loop {
-            let logits = model.forward(ctx.view([1, 3]));
+            let logits = model.forward(ctx.view([1, CHUNK_SIZE]));
             let prob = logits.softmax(1, Kind::Float);
             let idx = prob.multinomial(1, true).get(0).int64_value(&[0]);
             out.push(i_to_c[&(idx as usize)]);
