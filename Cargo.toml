@@ -12,7 +12,3 @@ rand = "0.8"
 rand_chacha = "0.3"
 tch = "0.16"
 torch-sys = { version = "0.16", features = ["download-libtorch"] }
-
-[[bin]]
-name = "mlp"
-path = "src/mlp.rs"
